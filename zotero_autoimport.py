@@ -5,8 +5,8 @@ Every PDF / DjVu / EPUB placed in INBOX becomes a Zotero item with the file
 attached, tagged TAG and filed into COLLECTION (or, if topics are configured,
 into the collection of its topic). Metadata come from Crossref when a DOI on
 the first pages checks out against the text, otherwise from a language model
-that reads the title pages: `claude -p` by default (as text, or as images for
-scans without a text layer), or any command given in ZAI_LLM_CMD (text only).
+configured in ZAI_LLM_CMD that reads the title pages (as text, as rendered page
+images for scans, or via ocrmypdf / filename fallback).
 
 Writes go through the endpoints of Zotero's browser connector on
 localhost:23119, which need no API key and therefore never pop an
@@ -37,10 +37,13 @@ def load_config(path):
     """KEY=VALUE lines from a local, untracked file; the real environment wins."""
     if not path.exists():
         return
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         key, sep, value = line.partition("=")
         if sep and not line.lstrip().startswith("#"):
-            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+            v = re.sub(r"\s+#.*$", "", value.strip())
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            os.environ.setdefault(key.strip(), v)
 
 
 load_config(Path(__file__).resolve().parent / "config.env")
@@ -64,10 +67,9 @@ def read_topics():
 
 
 TOPICS = read_topics()
-LLM_CMD = env("ZAI_LLM_CMD", "")  # empty: built-in claude backend
+LLM_CMD = env("ZAI_LLM_CMD", "")
 TAG = env("ZAI_TAG", "auto-import")
 DUP_TAG = env("ZAI_DUP_TAG", "possible-duplicate")  # added when a likely twin exists
-MODEL = env("ZAI_MODEL", "haiku")
 MAILTO = env("ZAI_CROSSREF_MAILTO", "")  # Crossref's "polite pool", optional
 LOG = Path.home() / "Library" / "Logs" / "zotero-autoimport.log"
 ZOTERO = "http://localhost:23119"
@@ -76,7 +78,7 @@ ZOTERO = "http://localhost:23119"
 def tool(name):
     path = shutil.which(name)
     if not path:
-        sys.exit(f"zotero-autoimport: '{name}' not found on PATH")
+        raise RuntimeError(f"'{name}' not found on PATH")
     return path
 
 EXTS = {".pdf": "application/pdf", ".djvu": "image/vnd.djvu",
@@ -180,7 +182,8 @@ and DOI when printed.
 def log(msg):
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}"
     print(line, flush=True)
-    with LOG.open("a") as f:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
@@ -196,7 +199,7 @@ def run(*cmd, **kw):
 # ---------------------------------------------------------------- extraction
 
 def page_count(path):
-    if path.suffix == ".pdf":
+    if path.suffix.lower() == ".pdf":
         m = re.search(r"^Pages:\s+(\d+)", run(tool("pdfinfo"), str(path)).stdout, re.M)
     else:
         m = re.match(r"\s*(\d+)", run(tool("djvused"), "-e", "n", str(path)).stdout)
@@ -210,7 +213,7 @@ def sample_pages(n):
 
 
 def page_text(path, p):
-    if path.suffix == ".pdf":
+    if path.suffix.lower() == ".pdf":
         r = run(tool("pdftotext"), "-layout", "-f", str(p), "-l", str(p), str(path), "-")
     else:
         r = run(tool("djvutxt"), f"--page={p}", str(path))
@@ -219,7 +222,7 @@ def page_text(path, p):
 
 def page_image(path, p, tmp, label):
     out = Path(tmp) / label
-    if path.suffix == ".pdf":
+    if path.suffix.lower() == ".pdf":
         run(tool("pdftoppm"), "-f", str(p), "-l", str(p), "-r", "110", "-gray",
             "-png", "-singlefile", str(path), str(out))
         return out.with_suffix(".png")
@@ -229,24 +232,58 @@ def page_image(path, p, tmp, label):
     return out.with_suffix(".png")
 
 
+def ocr_langs():
+    if env("ZAI_OCR_LANG"):
+        return env("ZAI_OCR_LANG")
+    t = shutil.which("tesseract")
+    out = run(t, "--list-langs").stdout.splitlines()[1:] if t else []
+    avail = [l.strip() for l in out if l.strip() in ("rus", "eng", "fra", "deu", "ukr", "ita", "spa")]
+    return "+".join(avail) or "eng"
+
+
+def ocr_pages(path, pages):
+    if path.suffix.lower() != ".pdf" or not shutil.which("ocrmypdf"):
+        return None
+    with tempfile.TemporaryDirectory(prefix="zai-") as tmp:
+        out = Path(tmp) / "ocr.pdf"
+        p_arg = ",".join(map(str, pages))
+        log(f"  running ocrmypdf on {len(pages)} pages")
+        r = run(tool("ocrmypdf"), "--pages", p_arg, "--force-ocr", "--output-type", "pdf",
+                "-q", "-l", ocr_langs(), str(path), str(out), timeout=300)
+        if r.returncode or not out.exists():
+            log(f"  ocrmypdf failed: {(r.stderr or r.stdout)[:200]}")
+            return None
+        return {p: page_text(out, p) for p in pages}
+
+
 def epub_text(path):
     """OPF metadata block plus the opening of the first content files."""
     with zipfile.ZipFile(path) as z:
         container = z.read("META-INF/container.xml").decode("utf-8", "replace")
-        opf_name = re.search(r'full-path="([^"]+)"', container).group(1)
+        opf_name = re.search(r'full-path=["\']([^"\']+)', container).group(1)
         opf = z.read(opf_name).decode("utf-8", "replace")
         meta = re.search(r"<(?:\w+:)?metadata.*?</(?:\w+:)?metadata>", opf, re.S)
         parts = ["[OPF metadata]\n" + (meta.group(0) if meta else "")]
         base = os.path.dirname(opf_name)
-        hrefs = re.findall(r'href="([^"]+\.x?html?)"', opf)[:4]
+        by_id = {}
+        for tag in re.findall(r"<(?:\w+:)?item\b[^>]+>", opf):
+            i = re.search(r'\bid=["\']([^"\']+)', tag)
+            h = re.search(r'\bhref=["\']([^"\']+)', tag)
+            if i and h:
+                by_id[i.group(1)] = h.group(1)
+        spine = [by_id[i] for i in re.findall(r'\bidref=["\']([^"\']+)', opf) if i in by_id]
+        hrefs = [h for h in (spine or by_id.values())
+                 if re.search(r"\.x?html?($|#)", h, re.I)][:4]
         for h in hrefs:
-            name = os.path.normpath(os.path.join(base, urllib.parse.unquote(h)))
+            rel = urllib.parse.unquote(h.partition("#")[0])
+            name = os.path.normpath(os.path.join(base, rel))
             try:
-                html = z.read(name).decode("utf-8", "replace")
+                raw = z.read(name).decode("utf-8", "replace")
             except KeyError:
                 continue
-            txt = re.sub(r"<[^>]+>", " ", html)
-            parts.append(f"[{h}]\n" + re.sub(r"\s+", " ", txt)[:3000])
+            raw = re.sub(r"<(style|script)\b[^>]*>.*?</\1>", " ", raw, flags=re.I | re.S)
+            txt = re.sub(r"<[^>]+>", " ", raw)
+            parts.append(f"[{rel}]\n" + re.sub(r"\s+", " ", txt)[:3000])
     return "\n\n".join(parts)
 
 
@@ -306,37 +343,20 @@ def crossref(doi, first_text):
 # ---------------------------------------------------------------- the model
 
 def llm(prompt, images=()):
-    """The model's reply as text. Images are read only by the built-in claude backend."""
+    """The model's reply as text."""
+    if not LLM_CMD:
+        raise RuntimeError("ZAI_LLM_CMD is not set; configure a model CLI in config.env")
     with tempfile.TemporaryDirectory(prefix="zai-") as empty:  # nothing for an agent to explore
-        if LLM_CMD:
-            if images:
-                raise RuntimeError("no text layer; reading page images needs the claude backend")
-            cmd = shlex.split(LLM_CMD)
-            stdin = prompt
-            if "{prompt}" in cmd:
-                cmd = [prompt if a == "{prompt}" else a for a in cmd]
-                stdin = None
-            r = subprocess.run(cmd, input=stdin, capture_output=True, text=True,
-                               timeout=300, cwd=empty)
-            if r.returncode:
-                raise RuntimeError(f"{cmd[0]} failed: {(r.stderr or r.stdout)[:300]}")
-            return r.stdout
-        cmd = [tool("claude"), "-p", "--model", MODEL, "--output-format", "json",
-               "--strict-mcp-config", "--no-session-persistence"]
-        if images:
-            cmd += ["--allowedTools", "Read", "--add-dir", str(images[0].parent)]
-        else:
-            cmd += ["--tools", ""]
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300,
-                           cwd=images[0].parent if images else empty)
-        try:
-            out = json.loads(r.stdout)
-        except json.JSONDecodeError:
-            raise RuntimeError(f"claude failed: {(r.stderr or r.stdout)[:300]}")
-        if out.get("is_error"):
-            raise RuntimeError(f"claude: {out.get('result', '')[:300]}")
-        log(f"  claude: ${out.get('total_cost_usd', 0):.3f}")
-        return out.get("result", "")
+        cmd = shlex.split(LLM_CMD, comments=True)
+        stdin = prompt
+        if "{prompt}" in cmd:
+            cmd = [prompt if a == "{prompt}" else a for a in cmd]
+            stdin = None
+        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                           timeout=300, cwd=images[0].parent if images else empty)
+        if r.returncode:
+            raise RuntimeError(f"{cmd[0]} failed: {(r.stderr or r.stdout)[:300]}")
+        return r.stdout
 
 
 def ask_topic(item):
@@ -349,24 +369,25 @@ def ask_topic(item):
     return next((t for t in TOPICS if re.search(rf"\b{re.escape(t)}\b", reply)), None)
 
 
-def ask_metadata(name, text, images):
+def ask_metadata(name, text, images=()):
     how = ""
     if images:
-        how = (" — it is a scan without a text layer, so the pages are given as images; "
-               "read each of these files with the Read tool: " + ", ".join(map(str, images)))
+        how = (" — it is a scan without a text layer, so the pages are given as image "
+               "files; read each of these files: " + ", ".join(map(str, images)))
     names = " | ".join(f'"{t}"' for t in TOPICS)
-    prompt = PROMPT.format(name=name, text=text or "(see images)", how=how,
+    prompt = PROMPT.format(name=name, text=text or "(see image files)", how=how,
                            types=" | ".join(FIELDS),
                            fields=", ".join(sorted({f for v in FIELDS.values() for f in v})),
                            topic_field=f'  "topic": {names},\n' if TOPICS else "",
                            topics=topics_rule() + "\n" if TOPICS else "")
     res = llm(prompt, images)
-    m = re.search(r"\{.*\}", res, re.S)
-    if not m:
-        raise RuntimeError(f"no JSON in model reply: {res[:200]}")
-    data = json.loads(m.group(0))
+    i = res.find("{")
+    try:
+        data, _ = json.JSONDecoder().raw_decode(res, i) if i >= 0 else (None, 0)
+    except json.JSONDecodeError:
+        data = None
     if not isinstance(data, dict):
-        raise RuntimeError(f"unexpected model reply: {res[:200]}")
+        raise RuntimeError(f"no JSON in model reply: {res[:200]}")
     if "error" in data:
         raise RuntimeError(f"model could not identify the file: {data['error']}")
     return data
@@ -402,8 +423,8 @@ def publisher(v):
 
 def clean(item):
     kind = item.get("itemType") if item.get("itemType") in FIELDS else "book"
-    out = {"itemType": kind,
-           "topic": item.get("topic") if item.get("topic") in TOPICS else None}
+    t = str(item.get("topic") or "").strip().lower()
+    out = {"itemType": kind, "topic": t if t in TOPICS else None}
     for f in FIELDS[kind]:
         v = item.get(f)
         if v not in (None, "", []):
@@ -419,11 +440,10 @@ def clean(item):
     if "originalDate" in out:  # Zotero has no such field; CSL and Better BibTeX read it from Extra
         out["extra"] = f"original-date: {out.pop('originalDate')}"
     out["creators"] = [
-        {"lastName": text(c.get("lastName", "")), "firstName": text(c.get("firstName", "")),
-         "creatorType": c["creatorType"]}
-        for c in item.get("creators") or []
-        if c.get("lastName") and c.get("creatorType", "author") in CREATOR_TYPES
-        for c in [dict(c, creatorType=c.get("creatorType", "author"))]]
+        {"lastName": text(c["lastName"]), "firstName": text(c.get("firstName") or ""),
+         "creatorType": role}
+        for c in item.get("creators") or [] if isinstance(c, dict) and text(c.get("lastName") or "")
+        for role in [c.get("creatorType") or "author"] if role in CREATOR_TYPES]
     return out
 
 
@@ -500,41 +520,85 @@ def save(item, path, topic, tags):
     zpost("updateSession", session)
     meta = {"sessionID": sid, "parentItemID": "it", "title": "Full Text", "url": path.as_uri()}
     zpost(f"saveAttachment?sessionID={sid}", None, raw=path.read_bytes(),
-          headers={"Content-Type": EXTS[path.suffix],
+          headers={"Content-Type": EXTS[path.suffix.lower()],
                    "X-Metadata": json.dumps(meta, ensure_ascii=True)})
     return name
 
 
 # ---------------------------------------------------------------- pipeline
 
+def fmt_pages(texts, head, tail, n):
+    # no PDF page numbers here: the model would report the file's length as numPages
+    return "\n".join([f"[page {i} from the start]\n{texts[p]}" for i, p in enumerate(head, 1)]
+                     + [f"[page {n - p + 1} from the end]\n{texts[p]}" for p in tail])
+
+
+def from_filename(path):
+    log("  using file name only")
+    try:
+        return clean(ask_metadata(path.name, "(no text layer; use the file name if it carries author or title)"))
+    except Exception as e:
+        log(f"  {e}; falling back to bare file name")
+        return {"itemType": "book", "title": path.stem, "creators": [], "topic": None}
+
+
 def metadata(path):
-    if path.suffix == ".epub":
-        return clean(ask_metadata(path.name, epub_text(path), []))
-    n = page_count(path)
+    ext = path.suffix.lower()
+    if ext == ".epub":
+        try:
+            return clean(ask_metadata(path.name, epub_text(path)))
+        except Exception as e:
+            log(f"  {e}")
+            return from_filename(path)
+    try:
+        n = page_count(path)
+    except Exception as e:
+        log(f"  {e}")
+        return from_filename(path)
     if not n:
-        raise RuntimeError("cannot read page count")
+        return from_filename(path)
     head, tail = sample_pages(n)
-    texts = {p: page_text(path, p) for p in head + tail}
+    pages = head + tail
+    texts = {p: page_text(path, p) for p in pages}
     first = "\n".join(texts[p] for p in head[:2])
-    if path.suffix == ".pdf":
+    if ext == ".pdf":
         for doi in dict.fromkeys(DOI_RE.findall(first)):
             item = crossref(doi, first)
             if item:
                 log(f"  metadata from Crossref ({doi})")
-                return clean(item)
-    # no PDF page numbers here: the model would report the file's length as numPages
-    body = "\n".join([f"[page {i} from the start]\n{texts[p]}" for i, p in enumerate(head, 1)]
-                     + [f"[page {n - p + 1} from the end]\n{texts[p]}" for p in tail])
+                item = clean(item)
+                if TOPICS:
+                    try:
+                        item["topic"] = ask_topic(item)
+                    except Exception as e:
+                        log(f"  topic lookup failed: {e}")
+                return item
+    body = fmt_pages(texts, head, tail, n)
     if len(re.sub(r"\s", "", body)) >= MIN_TEXT:
-        return clean(ask_metadata(path.name, body[:40000], []))
-    with tempfile.TemporaryDirectory(prefix="zai-") as tmp:
-        imgs = ([page_image(path, p, tmp, f"start-{i}") for i, p in enumerate(head, 1)]
-                + [page_image(path, p, tmp, f"end-{n - p + 1}") for p in tail])
-        imgs = [i for i in imgs if i.exists()]
-        if not imgs:
-            raise RuntimeError("no text layer and page rendering failed")
-        log(f"  no text layer, reading {len(imgs)} page images")
-        return clean(ask_metadata(path.name, "", imgs))
+        try:
+            return clean(ask_metadata(path.name, body[:40000]))
+        except Exception as e:
+            log(f"  {e}")
+            return from_filename(path)
+    try:
+        with tempfile.TemporaryDirectory(prefix="zai-") as tmp:
+            imgs = ([page_image(path, p, tmp, f"start-{i}") for i, p in enumerate(head, 1)]
+                    + [page_image(path, p, tmp, f"end-{n - p + 1}") for p in tail])
+            imgs = [i for i in imgs if i.exists()]
+            if imgs:
+                log(f"  no text layer, reading {len(imgs)} page images")
+                return clean(ask_metadata(path.name, "", imgs))
+    except Exception as e:
+        log(f"  image reading failed ({e})")
+    ocr = ocr_pages(path, pages)
+    if ocr:
+        body = fmt_pages(ocr, head, tail, n)
+        if len(re.sub(r"\s", "", body)) >= MIN_TEXT:
+            try:
+                return clean(ask_metadata(path.name, body[:40000]))
+            except Exception as e:
+                log(f"  {e}")
+    return from_filename(path)
 
 
 def move_to(path, folder):
@@ -548,7 +612,7 @@ def move_to(path, folder):
 def process(path):
     log(f"{path.name}")
     item = metadata(path)
-    topic = item.pop("topic") or (ask_topic(item) if TOPICS else None)
+    topic = item.pop("topic", None)
     who = ", ".join(c["lastName"] for c in item["creators"][:3])
     label = f"{who} — {item['title']}" if who else item["title"]
     if item.get("volume") and item["itemType"] == "book":
@@ -560,30 +624,37 @@ def process(path):
     notify(f"Zotero → {where}" + (" (possible duplicate)" if dup else ""), label)
 
 
-def ready(path):
-    """The path to process (suffix lower-cased), or None if not a finished download."""
+def ready(path, wait=True):
+    """True when path is an eligible file whose size has settled."""
     if path.name.startswith(".") or path.suffix.lower() not in EXTS or not path.is_file():
         return False
-    if path.suffix not in EXTS:  # .PDF -> .pdf, the rest of the code expects lower case
-        path = path.rename(path.with_suffix(path.suffix.lower()))
+    if not wait:
+        return path.stat().st_size > 0
     s = path.stat().st_size
-    time.sleep(2)
-    return path if path.exists() and s > 0 and path.stat().st_size == s else None
+    for _ in range(15):
+        time.sleep(2)
+        if not path.exists():
+            return False
+        s2 = path.stat().st_size
+        if s2 > 0 and s2 == s:
+            return True
+        s = s2
+    return False
 
 
 def main(args):
     INBOX.mkdir(parents=True, exist_ok=True)
+    explicit = bool(args)
+    files = [Path(a).resolve() for a in args] or sorted(INBOX.iterdir())
+    files = [p for p in files if not p.name.startswith(".") and p.suffix.lower() in EXTS and p.is_file()]
+    if not files:
+        return 0
     if not zotero_up():
         log("Zotero is not running, nothing done")
         notify("Zotero autoimport", f"Zotero is not running; files wait in {INBOX.name}")
         return 1
-    explicit = bool(args)
-    files = [Path(a).resolve() for a in args] or sorted(INBOX.iterdir())
     for path in files:
-        if path.is_dir():
-            continue
-        path = ready(path)
-        if not path:
+        if not ready(path, wait=not explicit):
             continue
         try:
             process(path)

@@ -34,8 +34,10 @@ For each file:
    edition at hand, only the volume's own ISBN, and no technical staff
    (proofreaders, designers) among the creators; it ignores advertisement
    pages at the end of a book.
-   OCR'd scans go this way like any PDF; a scan without a text layer is
-   rendered to images, which only the Claude backend can read.
+   For a scan without a text layer, the 9 pages are rendered to images for the
+   model to read; if that fails, the importer tries `ocrmypdf` on those pages
+   (when installed), then the file name, and finally imports the file under its
+   bare name so nothing is lost.
 3. **Topic** (only if topics are configured). The same call returns one of
    your topics, which picks the collection.
 
@@ -47,9 +49,6 @@ If the library already has an item with the same title, volume and (when
 both are known) year, the file is still imported, with an extra tag
 `possible-duplicate`; Zotero's *Duplicate Items* view merges the two if they
 really are the same.
-
-Cost with the default backend: one call per file without a usable DOI,
-typically $0.02–0.07.
 
 ## What happens to the file
 
@@ -65,16 +64,18 @@ Every run is logged to `~/Library/Logs/zotero-autoimport.log`.
 - macOS, Zotero 7 or later, running (the importer talks to it on
   `localhost:23119`; if Zotero is closed, files wait in the folder).
 - Python 3.9+, standard library only.
-- A model CLI: [Claude Code](https://claude.com/claude-code) (`claude`, the
-  default) or another one, see [Model](#model).
-- Poppler: `brew install poppler`. For DjVu also `brew install djvulibre`.
+- A model CLI configured in `config.env`, see [Model](#model).
+- Poppler: `brew install poppler`. Optional: `brew install djvulibre` for DjVu,
+  and `brew install ocrmypdf` (with `tesseract-lang`) as an OCR fallback for
+  PDF scans.
 
 ## Install
 
 ```sh
-git clone https://github.com/kiktres/zotero-autoimport
+git clone https://github.com/ilnur-baibulov/zotero-autoimport
 cd zotero-autoimport
-./install.sh                  # or ./install.sh /path/to/another/folder
+cp config.env.example config.env   # set ZAI_LLM_CMD and your collection
+./install.sh                       # or ./install.sh /path/to/another/folder
 ```
 
 `install.sh` writes a launchd agent to
@@ -100,8 +101,8 @@ time, so pass it to `install.sh` instead.
 | `ZAI_TOPIC_<name>` | none | optional topic, see below |
 | `ZAI_TAG` | `auto-import` | tag put on every imported item |
 | `ZAI_DUP_TAG` | `possible-duplicate` | extra tag when a likely twin exists |
-| `ZAI_LLM_CMD` | empty | model command, see [Model](#model) |
-| `ZAI_MODEL` | `haiku` | model for the default `claude` backend |
+| `ZAI_LLM_CMD` | none (required) | model command, see [Model](#model) |
+| `ZAI_OCR_LANG` | installed Tesseract langs | languages passed to `ocrmypdf -l` |
 | `ZAI_CROSSREF_MAILTO` | empty | your e-mail for Crossref's polite pool |
 
 Collections are matched by name; create them in Zotero first. If a collection
@@ -119,29 +120,27 @@ belongs there. An item that fits no topic goes to `ZAI_COLLECTION`.
 
 ## Model
 
-By default the importer calls `claude -p --model haiku`, which needs Claude
-Code installed and logged in. To use another model, set `ZAI_LLM_CMD` to a
-command that prints the model's reply. `{prompt}` in the command is replaced
-by the prompt; without it, the prompt is sent on stdin.
+Set `ZAI_LLM_CMD` in `config.env` to any command that prints the model's reply.
+`{prompt}` in the command is replaced by the prompt; without it, the prompt is
+sent on stdin.
 
 ```sh
-ZAI_LLM_CMD=agy --model gemini-3.8-flash-low -p {prompt}   # Antigravity CLI
-ZAI_LLM_CMD=copilot -s -p {prompt}          # GitHub Copilot CLI
-ZAI_LLM_CMD=codex exec --skip-git-repo-check {prompt}   # OpenAI Codex CLI
-ZAI_LLM_CMD=ollama run qwen2.5:14b          # local model via Ollama
+ZAI_LLM_CMD=agy --model gemini-3.8-flash-low -p {prompt}                 # Antigravity CLI
+ZAI_LLM_CMD=claude -p --model haiku --no-session-persistence --allowedTools Read   # Claude Code
+ZAI_LLM_CMD=copilot -s -p {prompt}                                       # GitHub Copilot CLI
+ZAI_LLM_CMD=codex exec --skip-git-repo-check {prompt}                    # OpenAI Codex CLI
+ZAI_LLM_CMD=ollama run qwen2.5:14b                                       # local model via Ollama
 ```
 
-`agy` and `copilot` were checked against `claude` on the same Russian book
-and returned the same record; the Codex and Ollama lines are untested.
+`claude`, `agy` and `copilot` were tested on Russian and English books; the
+`codex` and `ollama` lines are untested examples.
 
 **Pin a small model.** The task is extraction from a few pages; a small model
-does it as well as a large one. The default `claude` backend passes
-`--model haiku` (the run reports `claude-haiku-4-5`). Other CLIs use their own
-default unless told otherwise — for `agy` that is Gemini Flash (High), for
-Copilot it depends on your plan — so give their `--model` flag a small model
-your account offers (`agy models` lists them). The reply must contain one JSON object; anything
-around it is ignored. These backends receive text only, so a scan without a
-text layer fails with a message instead of being imported.
+does it as well as a large one. Most CLIs use a large default unless told
+otherwise — for `agy` that is Gemini Flash (High), for Copilot it depends on
+your plan — so pass their `--model` flag a small model your account offers
+(`agy models` lists them). The reply must contain one JSON object; anything
+around it is ignored.
 
 ## How it writes to Zotero
 
