@@ -16,6 +16,8 @@ It runs on macOS as a watched folder (`~/Downloads/to-zotero` by default).
 Imported items are tagged `auto-import` and filed into one collection (or one
 per topic); a notification says what was added.
 
+> **Note.** This is a vibe-coded personal tool built around my own workflow. Feel free to use, adapt or fork it.
+
 ## How metadata are found
 
 For each file:
