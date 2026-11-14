@@ -130,12 +130,12 @@ sent on stdin.
 ZAI_LLM_CMD=agy --model gemini-3.8-flash-low -p {prompt}                 # Antigravity CLI
 ZAI_LLM_CMD=claude -p --model haiku --no-session-persistence --allowedTools Read   # Claude Code
 ZAI_LLM_CMD=copilot -s -p {prompt}                                       # GitHub Copilot CLI
-ZAI_LLM_CMD=codex exec --skip-git-repo-check {prompt}                    # OpenAI Codex CLI
+ZAI_LLM_CMD=codex exec -m gpt-6-luna -c model_reasoning_effort="low" --skip-git-repo-check --ephemeral   # OpenAI Codex CLI
 ZAI_LLM_CMD=ollama run qwen2.5:14b                                       # local model via Ollama
 ```
 
-`claude`, `agy` and `copilot` were tested on Russian and English books; the
-`codex` and `ollama` lines are untested examples.
+`claude`, `agy`, `copilot` and `codex` were tested on Russian and English
+books; the `ollama` line is an untested example.
 
 **Pin a small model.** The task is extraction from a few pages; a small model
 does it as well as a large one. Most CLIs use a large default unless told
